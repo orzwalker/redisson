@@ -40,12 +40,14 @@ public class LockPubSub extends PublishSubscribe<RedissonLockEntry> {
 
     @Override
     protected void onMessage(RedissonLockEntry value, Long message) {
+        // 如果是解锁消息
         if (message.equals(UNLOCK_MESSAGE)) {
             Runnable runnableToExecute = value.getListeners().poll();
             if (runnableToExecute != null) {
                 runnableToExecute.run();
             }
 
+            // 释放一个信号量，唤醒等待的entry.getLatch().tryAcquire()去尝试申请锁
             value.getLatch().release();
         } else if (message.equals(READ_UNLOCK_MESSAGE)) {
             while (true) {

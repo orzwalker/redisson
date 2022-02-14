@@ -125,12 +125,16 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         return id + ":" + threadId;
     }
 
+    /**
+     * 续期任务
+     */
     private void renewExpiration() {
         ExpirationEntry ee = EXPIRATION_RENEWAL_MAP.get(getEntryName());
         if (ee == null) {
             return;
         }
-        
+
+        // watchdog的实现
         Timeout task = commandExecutor.getConnectionManager().newTimeout(new TimerTask() {
             @Override
             public void run(Timeout timeout) throws Exception {
@@ -142,7 +146,8 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                 if (threadId == null) {
                     return;
                 }
-                
+
+                // eval执行lua续期
                 RFuture<Boolean> future = renewExpirationAsync(threadId);
                 future.whenComplete((res, e) -> {
                     if (e != null) {
@@ -150,11 +155,13 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
                         EXPIRATION_RENEWAL_MAP.remove(getEntryName());
                         return;
                     }
-                    
+
+                    // 续期成功，递归调用
                     if (res) {
                         // reschedule itself
                         renewExpiration();
                     } else {
+                        // 对象的锁不存在，返回
                         cancelExpirationRenewal(null);
                     }
                 });
@@ -165,13 +172,17 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
     }
     
     protected void scheduleExpirationRenewal(long threadId) {
+        // 记录线程重入计数
         ExpirationEntry entry = new ExpirationEntry();
         ExpirationEntry oldEntry = EXPIRATION_RENEWAL_MAP.putIfAbsent(getEntryName(), entry);
         if (oldEntry != null) {
+            // 当前线程重入计数
             oldEntry.addThreadId(threadId);
         } else {
+            // 当前线程首次加锁
             entry.addThreadId(threadId);
             try {
+                // 首次加锁需要触发续期任务
                 renewExpiration();
             } finally {
                 if (Thread.currentThread().isInterrupted()) {
@@ -181,6 +192,9 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
         }
     }
 
+    /**
+     * lua 续期
+     */
     protected RFuture<Boolean> renewExpirationAsync(long threadId) {
         return evalWriteAsync(getRawName(), LongCodec.INSTANCE, RedisCommands.EVAL_BOOLEAN,
                 "if (redis.call('hexists', KEYS[1], ARGV[2]) == 1) then " +
@@ -313,20 +327,24 @@ public abstract class RedissonBaseLock extends RedissonExpirable implements RLoc
 
     @Override
     public RFuture<Void> unlockAsync(long threadId) {
+        // eval执行lua释放锁，并不一定释放成功了，有可能重入次数比较大
         RFuture<Boolean> future = unlockInnerAsync(threadId);
 
         CompletionStage<Void> f = future.handle((opStatus, e) -> {
+            // 取消续期任务
             cancelExpirationRenewal(threadId);
 
             if (e != null) {
                 throw new CompletionException(e);
             }
+            // 加锁和解锁的客户端线程不是同一个
             if (opStatus == null) {
                 IllegalMonitorStateException cause = new IllegalMonitorStateException("attempt to unlock lock, not locked by current thread by node id: "
                         + id + " thread-id: " + threadId);
                 throw new CompletionException(cause);
             }
 
+            // 解锁成功
             return null;
         });
 
